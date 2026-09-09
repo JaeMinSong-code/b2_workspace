@@ -1,0 +1,5 @@
+{
+    "python.defaultInterpreterPath": "/home/jaemin/anaconda3/envs/isaacsim/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true
+}

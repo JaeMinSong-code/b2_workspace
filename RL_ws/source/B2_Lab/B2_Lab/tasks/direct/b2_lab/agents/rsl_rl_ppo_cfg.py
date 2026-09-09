@@ -7,12 +7,11 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 class B2LabFlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     experiment_name: str = "b2"
-    num_steps_per_env: int = 24
-    # num_steps_per_env: int = 48
+    num_steps_per_env: int = 48
     max_iterations: int = 100000
     save_interval: int = 50
     empirical_normalization: bool = False
-    num_cost: int = 6
+    num_cost: int = 5
     clip_actions: float = 10.0
     history_length: int = 10.0
 

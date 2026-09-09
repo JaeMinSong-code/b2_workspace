@@ -10,7 +10,6 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg  # TerrainImporterCfg: 지형 생성 설정
 from isaaclab.utils import configclass
 from B2_Lab.robots.B2_robot import B2_CFG  # isort: skip
-from isaaclab.utils.noise import NoiseModelCfg, GaussianNoiseCfg
 from B2_Lab.terrains import ROUGH_TERRAINS_CFG, CUSTOM_TERRAINS_CFG, CURRICULUM_TERRAINS_CFG  # isort: skip
 
 
@@ -21,13 +20,12 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*foot.*"),
-            # "static_friction_range": (0.8, 0.8),
-            "static_friction_range": (0.3, 0.6),
-            # "dynamic_friction_range": (0.6, 0.6),
-            "dynamic_friction_range": (0.3, 1.2),
-            # "restitution_range": (0.0, 0.0),
+            "static_friction_range": (0.5, 1.25),
+            "dynamic_friction_range": (0.4, 1.0),
             "restitution_range": (0.0, 0.3),
             "num_buckets": 64,
+            # 샘플별로 dynamic <= static 을 보장 (물리적 일관성)
+            "make_consistent": True,
         },
     )
 
@@ -41,17 +39,28 @@ class EventCfg:
         },
     )
 
-    # # Actuator gains randomization
-    # randomize_actuator_gains = EventTerm(
-    #     func=mdp.randomize_actuator_gains,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-    #         "stiffness_distribution_params": (0.8, 1.2),    # ±20% 변화
-    #         "damping_distribution_params": (0.7, 1.3),      # ±30% 변화
-    #         "operation": "scale",  # 기본값에 곱하기
-    #     },
-    # )
+    # Actuator gains randomization (privileged obs의 stiffness/damping 항이 이 값을 반영)
+    randomize_actuator_gains = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (0.9, 1.1),     # ±10%
+            "damping_distribution_params": (0.85, 1.15),     # ±15%
+            "operation": "scale",  # 기본값에 곱하기
+        },
+    )
+
+    # 주기적 외란 (base 속도에 push 주입) — 실기 강건성용, 약하게 설정
+    push_robot = EventTerm(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(10.0, 15.0),
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
+        },
+    )
 
     # Joint friction randomization
     randomize_joint_friction = EventTerm(
@@ -84,18 +93,23 @@ class B2LabFlatEnvCfg(DirectRLEnvCfg):
     episode_length_s = 30.0
     decimation = 4
     action_scale = 0.25
+    hip_roll_action_scale_factor = 0.5
     action_space = 12          # B2 : 12-DOF
     observation_space = 49     # = num_proprio (B2)
     state_space = 0
     # action_noise_model = True
 
-    observation_noise_model: NoiseModelCfg = NoiseModelCfg(
-        noise_cfg=GaussianNoiseCfg(
-            mean=0.0,
-            std=0.05,  # 5% 표준편차
-            operation="add"
-        )
-    )
+    # observation noise: 성분별 물리 단위 std (Gaussian, _init_buffers에서 obs scale을
+    # 곱해 scaled space 벡터로 변환). cmd/actions/clock은 내부 생성값이라 노이즈 없음.
+    # NoiseModelCfg 대신 직접 적용 — history에 push되기 전에 노이즈를 입혀
+    # CENet이 noisy history를 보고 학습하도록 함 (_get_observations 참조).
+    add_observation_noise = True
+
+    class noise_std:
+        ang_vel = 0.2     # rad/s  (IMU gyro)
+        gravity = 0.05    # 단위벡터 성분 (자세 추정 오차)
+        joint_pos = 0.01  # rad    (관절 엔코더)
+        joint_vel = 1.5   # rad/s  (엔코더 미분)
 
     # B2 proprio = ang_vel(3)+proj_grav(3)+cmd(3)+joint_pos(12)+joint_vel(12)+actions(12)+clock(4) = 49
     num_proprio = 49
@@ -113,7 +127,7 @@ class B2LabFlatEnvCfg(DirectRLEnvCfg):
     target_height = 0.55
 
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 200,
+        dt=1 / 400,
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.81),  # 중력 명시적 설정
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -138,24 +152,7 @@ class B2LabFlatEnvCfg(DirectRLEnvCfg):
         ),
         debug_vis=False,
     )
-    # terrain = TerrainImporterCfg(
-    #     prim_path="/World/ground",
-    #     terrain_type="generator",
-    #     terrain_generator=CUSTOM_TERRAINS_CFG,
-    #     max_init_terrain_level=9,
-    #     collision_group=-1,
-    #     physics_material=sim_utils.RigidBodyMaterialCfg(
-    #         friction_combine_mode="multiply",
-    #         restitution_combine_mode="multiply",
-    #         static_friction=1.0,
-    #         dynamic_friction=1.0,
-    #     ),
-    #     visual_material=sim_utils.MdlFileCfg(
-    #         mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-    #         project_uvw=True,
-    #     ),
-    #     debug_vis=False,
-    # )
+
     # terrain = TerrainImporterCfg(
     #     prim_path="/World/ground",
     #     terrain_type="generator",
@@ -171,6 +168,8 @@ class B2LabFlatEnvCfg(DirectRLEnvCfg):
     #     ),
     #     debug_vis=False,
     # )
+    # terrain curriculum on/off. plane 지형이면 반드시 False, generator+curriculum 지형이면 True.
+    terrain_curriculum = False
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
@@ -238,33 +237,58 @@ class B2LabFlatEnvCfg(DirectRLEnvCfg):
     )
     debug_viz: bool = False
     terrain_curriculum: bool = True
+    foot_radius: float = 0.035
 
     class rewards:
         class scales:
+            # 이전 45 kg 로봇 포팅 설정 (비교용으로 보존)
             # tracking_lin_vel = 4.0
             # tracking_foot_pos = 4.0
-            # tracking_lin_vel_LPF = 4.0
-            tracking_ang_vel = 2.0
-            penalty_ang_vel = -0.5
-            lin_vel_z = -2.0
-            ang_vel_xy = -5.0 # ang_vel_xy = -0.5
-            orientation = -25.0  # orientation = -25.
-            torques = -2.5e-4
-            dof_acc = -2.5e-6
-            dof_vel = -1e-3
+            # tracking_lin_vel_LPF = 4.0  # 함수/LPF버퍼 삭제됨 — 다시 쓰려면 복구 필요
             # base_height = -5.0
-            action_rate = -0.1  # action_rate = -0.01
-            action_smoothness_1 = -0.1  # action_smoothness_1 = -0.01
-            action_smoothness_2 = -0.1  # action_smoothness_2 = -0.01
-            joint_deviation_from_default = -0.1  # joint_deviation_from_default = -0.05
-            contact_vel = -2.5
-            stand_still = -5.0
-            no_slip_vel = -1.0
-            raibert_foot_placement = 8.0
-            # com_follow_tilted_support_center = -50.0
-            # avoid_stair_edge_from_footscan = -20.0
+            # tracking_ang_vel = 2.0
+            # penalty_ang_vel = -0.5
+            # lin_vel_z = -2.0
+            # ang_vel_xy = -5.0
+            # orientation = -25.0
+            # torques = -2.5e-4
+            # dof_acc = -2.5e-6
+            # dof_vel = -1e-3
+            # action_rate = -0.1
+            # action_smoothness_1 = -0.1
+            # action_smoothness_2 = -0.1
+            # joint_deviation_from_default = -0.1
+            # contact_vel = -2.5
+            # stand_still = -5.0
+            # no_slip_vel = -1.0
 
-        tracking_sigma = 0.15  # tracking reward = exp(-error^2/sigma)
+            # unitree_rl_lab B2 기본 보행 설정
+            # tracking_lin_vel = 5.0
+            # tracking_ang_vel = 3.0
+            tracking_lin_vel = 5.0
+            tracking_ang_vel = 3.0
+            base_height = -5.0
+            lin_vel_z = -6.0
+            ang_vel_xy = -10.0  # ang_vel_xy = -30.0
+            # roll_orientation = -20.0
+            orientation = -50.0
+            torques = -1.0e-5
+            dof_acc = -2.5e-7
+            dof_vel = -1.0e-7
+            action_rate = -0.01
+            joint_deviation_from_default = -0.7
+            # no_slip_vel = -1.5
+
+            # 기본 보행을 먼저 학습하기 위해 중복/커스텀 shaping은 비활성화
+            penalty_ang_vel = 0.0
+            action_smoothness_1 = 0.0
+            action_smoothness_2 = -0.1
+            # contact_vel = -0.5
+            # swing_horizontal = -10.0
+            stand_still = -5.0
+
+        # 이전 값: tracking_sigma = 0.15
+        tracking_sigma = 0.25  # B2 reference std=sqrt(0.25)와 동일한 exp 분모
         sigma_rew_neg = 0.02
         reward_container_name = "B2quadReward"
         kappa_gait_probs = 0.07
@@ -276,21 +300,20 @@ class B2LabFlatEnvCfg(DirectRLEnvCfg):
             c1com_height = 1.0        # 0
             c2dof_pos = 1.0           # 1
             c3dof_vel = 1.0           # 2
-            # c4single_foot_lift_constraint = 1.0   # 3
-            c4foot_clearance = 1.0    # 3
-            c5gait_pattern = 1.0      # 4
-            c6undesired_contact = 1.0   # 5
-            # no_slip = 1.0           # 6
-            # feet_stance_time = 1.0
+            # c4foot_clearance = 1.0
+            c5gait_pattern = 1.0      # 3
+            c6undesired_contact = 1.0  # 4
 
     class commands:
         num_commands = 3  # default: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
         resampling_time = 10.  # time before command are changed[s]
         # resampling_time = 20.  # time before command are changed[s]
         heading_command = False  # heading 명령어 사용 여부 (False면 ang_vel_yaw 명령어 사용)
+        zero_command_probability = 0.05
+        zero_command_threshold = 0.05
 
         class ranges:
-            lin_vel_x = [-0.5, 0.5]  # min max [m/s]
-            lin_vel_y = [-0.5, 0.5]   # min max [m/s]
-            ang_vel_yaw = [-0.5, 0.5]    # min max [rad/s]
+            lin_vel_x = [-1.0, 1.0]  # min max [m/s]
+            lin_vel_y = [-1.0, 1.0]   # min max [m/s]
+            ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
             heading = [-3.14, 3.14]    # min max [rad/s] # heading 모드용으로 넓게 설정

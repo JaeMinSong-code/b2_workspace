@@ -31,7 +31,29 @@ import os
 import sys
 import time
 import torch
+
+# 학습에 사용한 RSL-RL 구현을 checkpoint 로드 전에 명시적으로 선택한다.
+if args_cli.rsl_rl_type == "constraints":
+    rsl_rl_source_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../source/rsl_rl_constraints")
+    )
+else:
+    rsl_rl_source_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../source/rsl_rl_2.3.3")
+    )
+sys.path.insert(0, rsl_rl_source_dir)
+
+import rsl_rl
 from rsl_rl.runners import OnPolicyRunner
+
+loaded_rsl_rl_path = os.path.realpath(rsl_rl.__file__)
+expected_rsl_rl_path = os.path.realpath(os.path.join(rsl_rl_source_dir, "rsl_rl"))
+if os.path.commonpath([loaded_rsl_rl_path, expected_rsl_rl_path]) != expected_rsl_rl_path:
+    raise RuntimeError(
+        f"Wrong rsl_rl package loaded: {loaded_rsl_rl_path}. "
+        f"Expected a package under: {expected_rsl_rl_path}"
+    )
+print(f"[INFO] Using {args_cli.rsl_rl_type} rsl_rl library: {loaded_rsl_rl_path}")
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -48,16 +70,16 @@ import B2_Lab.tasks  # noqa: F401
 from B2_Lab.tasks.direct.b2_lab.agents.vecenv_wrapper import RslRlVecEnvWrapper
 from B2_Lab.tasks.direct.b2_lab.agents.rsl_rl_ppo_cfg import B2LabFlatPPORunnerCfg
 from exporter import export_policy_as_onnx
+from play_logger import PlayLogger
 import isaaclab.sim as sim_utils
 from isaaclab.terrains import TerrainImporterCfg
-from B2_Lab.terrains import ROUGH_TERRAINS_CFG, CUSTOM_TERRAINS_CFG, CURRICULUM_TERRAINS_CFG
-import isaaclab.terrains as terrain_gen
-# Define play terrain configuration
-PLAY_TERRAINS_CFG = CUSTOM_TERRAINS_CFG.replace(
-    num_rows=2,
-    num_cols=2,
-    curriculum=False,
+from B2_Lab.terrains import (
+    ROUGH_TERRAINS_CFG,
+    CUSTOM_TERRAINS_CFG,
+    CURRICULUM_TERRAINS_CFG,
+    PLAY_TERRAINS_CFG,
 )
+import isaaclab.terrains as terrain_gen
 
 
 def _find_logs_rsl_rl_dir(checkpoint_path: str) -> str:
@@ -163,7 +185,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # Override terrain configuration for play
-    # env_cfg.terrain = TerrainImporterCfg(prim_path="/World/ground", terrain_generator=PLAY_TERRAINS_CFG,)
+    # 기본: 난이도 중간대로 좁힌 play 전용 소형 지형. 학습 terrain의 prim_path/physics_material 재사용.
+    env_cfg.terrain.terrain_generator = PLAY_TERRAINS_CFG
+    env_cfg.terrain.max_init_terrain_level = 0
+    env_cfg.terrain_curriculum = False  # 평가 중 terrain level 진급 끔
+
+    # 실제 학습에 사용한 지형(전체 난이도 range)으로 play하려면 위 3줄 대신 아래 사용:
+    # env_cfg.terrain.terrain_generator = CURRICULUM_TERRAINS_CFG
+    # env_cfg.terrain.max_init_terrain_level = 9   # 보고 싶은 난이도 레벨(0~9)
+    # env_cfg.terrain_curriculum = False           # 평가 중 진급은 끔
+
     # env_cfg.debug_viz = True
     # env_cfg.foot_scanner_HR.debug_vis = True
     # env_cfg.foot_scanner_HL.debug_vis = True
@@ -197,14 +228,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             checkpoint_path=resume_path,
         )
 
-    manual_commands = torch.tensor([-0.5, 0.0, 0.0], device=env.unwrapped.device)
-    manual_vxy = torch.tensor([-0.5, 0.0], device=env.unwrapped.device)
+    manual_commands = torch.tensor([1.0, 0.0, 0.0], device=env.unwrapped.device)
+    manual_vxy = torch.tensor([0.5, 0.0], device=env.unwrapped.device)
     manual_heading = torch.tensor([0.0], device=env.unwrapped.device)
     env.unwrapped._commands[:] = manual_commands.unsqueeze(0).repeat(env.unwrapped.num_envs, 1)
     # env.unwrapped._commands[:, 0:2] = manual_vxy.unsqueeze(0).repeat(env.unwrapped.num_envs, 1)
     env.unwrapped._heading_cmd[:] = manual_heading.repeat(env.unwrapped.num_envs)
 
     step_count = 0  # 스텝 카운터 추가````
+
+    # 재생 데이터 로깅 (종료 시 checkpoint run 폴더에 PNG 저장)
+    data_logger = PlayLogger(env.unwrapped)
 
     _, obs_dict = env.get_observations()
 
@@ -226,14 +260,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 actions = policy(actor_obs)
                 _, _, _, _, obs_dict = env.step(actions)
 
+            data_logger.log_step(step_count * dt)
+
             sleep_time = dt - (time.time() - start_time)
             if args_cli.real_time and sleep_time > 0:
                 time.sleep(sleep_time)
     finally:
+        plot_path = data_logger.save(
+            out_dir=os.path.join(os.path.dirname(resume_path), "play_plots"),
+            target_height=env.unwrapped.cfg.target_height,
+        )
+        if plot_path is not None:
+            print(f"[play_b2] 플롯 저장: {plot_path}")
         env.close()
 
 
 if __name__ == "__main__":
     main()
     simulation_app.close()
-

@@ -312,18 +312,18 @@ class RewardsCfg:
         },
     )
     # 한 발 오래 들기 치팅 방지: 0.5s 넘으면 초과분 제곱 벌점(1초쯤 커짐)
-    # feet_air_time_penalty = RewTerm(
-    #     func=mdp.feet_air_time_penalty,
-    #     weight=-30.0,
-    #     params={
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-    #         "start_time": 0.5,
-    #         "power": 2.0,
-    #     },
-    # )
+    feet_air_time_penalty = RewTerm(
+        func=mdp.feet_air_time_penalty,
+        weight=-30.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "start_time": 0.5,
+            "power": 2.0,
+        },
+    )
     air_time_variance = RewTerm(
         func=mdp.air_time_variance_penalty,
-        weight=-1.0,
+        weight=-5.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot")},
     )
     feet_slide = RewTerm(

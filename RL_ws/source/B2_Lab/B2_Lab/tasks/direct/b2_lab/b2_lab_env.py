@@ -11,7 +11,6 @@ import numpy as np
 from isaaclab.utils.math import quat_apply_inverse, quat_apply, wrap_to_pi, quat_apply_yaw
 import omni.usd
 from pxr import UsdGeom, Gf, Sdf
-from .obstacle_ladder import spawn_ladder_boxes_per_env
 import time
 
 
@@ -60,25 +59,13 @@ class B2LabEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
-        # spawn_ladder_boxes_per_env(
-        #     num_envs=self.num_envs,
-        #     base_x=2.0, base_y=0.0, base_z=0.0,
-        #     ladder_width=1.45,
-        #     ladder_height=2.2,
-        #     rail_thickness=0.08,
-        #     rung_thickness=0.07,
-        #     rung_count=12,
-        #     root_name="Ladder",
-        #     pitch_deg=15.0,
-        # )
-
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone()
-        self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos
+        self._processed_actions = self._action_scale * self._actions + self._robot.data.default_joint_pos
         self.joint_pos_target = self._processed_actions.clone()
 
         # World frame에서 발 위치 가져오기 (이름 기반 foot body id, 순서 [FL,FR,RL,RR])
@@ -115,19 +102,6 @@ class B2LabEnv(DirectRLEnv):
         )
         env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt) == 0).nonzero(as_tuple=False).flatten()
         self._resample_commands(env_ids)
-        if self.cfg.commands.heading_command:
-            base_quat = self._robot.data.root_quat_w
-            forward = quat_apply(base_quat, self.forward_vec)
-            heading = torch.atan2(forward[:, 1], forward[:, 0])
-            heading_err = wrap_to_pi(self._heading_cmd - heading)  # [-pi, pi]
-            yaw_cmd = 0.5 * heading_err
-            yaw_cmd = torch.clip(yaw_cmd, -0.5, 0.5)
-            deadband = 5.0 * np.pi / 180.0  # 5 deg in rad
-            yaw_cmd = torch.where(torch.abs(heading_err) < deadband, torch.zeros_like(yaw_cmd), yaw_cmd)
-            yaw_cmd = torch.where(self._yaw_stop_mask, torch.zeros_like(yaw_cmd), yaw_cmd)
-            yaw_cmd = torch.where(torch.abs(yaw_cmd) < 0.05, torch.zeros_like(yaw_cmd), yaw_cmd)
-            self._commands[:, 2] = yaw_cmd
-        self._update_lin_vel_filter()
 
     def _post_physics_step(self):
         self.last_last_joint_pos_target[:] = self.last_joint_pos_target[:]
@@ -170,13 +144,20 @@ class B2LabEnv(DirectRLEnv):
                 self.clock_inputs,                                     # 4
             ],
             dim=-1,
-        )  # total = 61
+        )  # total = 49
+
+        # 센서 노이즈는 history에 push되기 전에 적용 → CENet/actor가 noisy 입력으로 학습.
+        # critic_obs와 CENet의 recon/vel target은 clean 유지 (privileged 정보)
+        if self.cfg.add_observation_noise:
+            noisy_obs = obs + torch.randn_like(obs) * self.obs_noise_std_vec
+        else:
+            noisy_obs = obs
 
         self.obs_history_buf = torch.where(
             (self.episode_length_buf <= 1)[:, None, None],
-            torch.stack([obs] * self.cfg.num_history_len, dim=1),
+            torch.stack([noisy_obs] * self.cfg.num_history_len, dim=1),
             torch.cat(
-                [self.obs_history_buf[:, 1:], obs.unsqueeze(1)],
+                [self.obs_history_buf[:, 1:], noisy_obs.unsqueeze(1)],
                 dim=1,
             ),
         )
@@ -193,10 +174,10 @@ class B2LabEnv(DirectRLEnv):
             dim=-1,
         )
 
-        self.obs_buf = obs
+        self.obs_buf = noisy_obs
         self.critic_obs = torch.cat(
             (
-                self.obs_buf,
+                obs,  # critic은 clean obs 사용
                 self._robot.data.root_lin_vel_b * 2.0,
                 self.privileged_obs_buf,
                 self.foot_height_vec * 5.0,
@@ -209,10 +190,12 @@ class B2LabEnv(DirectRLEnv):
             "policy": self.actor_obs,
             "critic_obs": self.critic_obs,
             "prop_obs": self.obs_buf,
+            "prop_obs_clean": obs,  # CENet recon target용 (denoising 학습)
             "prop_obs_history": self.flattened_history_obs,
             "height_obs": height_data,
             "velocity_estimator_obs": self.flattened_history_obs,
-            "velocity_estimator_target": self._robot.data.root_lin_vel_b,
+            # critic의 lin_vel 스케일(x2.0)과 통일 — CENet v_hat도 같은 space가 됨
+            "velocity_estimator_target": self._robot.data.root_lin_vel_b * 2.0,
             "priv_obs": self.flattened_history_obs,
             "priv_obs_target": self.privileged_obs_buf,
         }
@@ -225,12 +208,34 @@ class B2LabEnv(DirectRLEnv):
         base_contact = torch.any(torch.max(torch.norm(net_contact_forces[:, :, self._base_id], dim=-1), dim=1)[0] > 1.0, dim=1)
         # body_contact = torch.any(torch.max(torch.norm(net_contact_forces[:, :, self._body_contact_ids], dim=-1), dim=1)[0] > 1.0, dim=1)
         died = base_contact
-        died = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # died = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         return died, time_out
+
+    def _update_terrain_levels(self, env_ids: torch.Tensor):
+        """이번 에피소드 이동거리를 보고 해당 env의 terrain level을 올리거나 내린다.
+        (IsaacLab ``mdp.terrain_levels_vel`` 과 동일 로직, direct env용 이식)
+        주의: root state를 새 위치로 쓰기 전에(=에피소드 종료 위치일 때) 호출해야 한다."""
+        # 스폰 원점에서 실제로 이동한 수평 거리
+        distance = torch.norm(
+            self._robot.data.root_pos_w[env_ids, :2] - self._terrain.env_origins[env_ids, :2],
+            dim=1,
+        )
+        # 지형 한 칸의 절반 이상 이동 → 진급
+        move_up = distance > self._terrain.cfg.terrain_generator.size[0] / 2
+        # 명령대로 갔어야 할 거리의 절반도 못 감 → 강등 (진급 대상은 제외)
+        move_down = (
+            distance < torch.norm(self._commands[env_ids, :2], dim=1) * self._max_episode_length_s * 0.5
+        )
+        move_down *= ~move_up
+        self._terrain.update_env_origins(env_ids, move_up, move_down)
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
+        # terrain curriculum: root state를 덮어쓰기 전에 레벨 갱신.
+        # plane 지형(terrain_generator=None)에서는 절대 실행 안 함(방어).
+        if getattr(self.cfg, "terrain_curriculum", False) and self._terrain.cfg.terrain_generator is not None:
+            self._update_terrain_levels(env_ids)
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs:
@@ -248,18 +253,8 @@ class B2LabEnv(DirectRLEnv):
         self._resample_commands(env_ids)
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]
-        self._lin_vel_xy_filt[env_ids] = self._robot.data.root_lin_vel_b[env_ids, :2]
         default_root_state = self._robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
-        #-------------if zmp preveiw 관련 변수들 초기화-------------#
-        root_xy = default_root_state[:, :2]
-        self.zmp_wp_xy[env_ids]      = root_xy
-        self.zmp_wp_xy_seq[env_ids]  = root_xy[:, None, :].repeat(1, self._zmp_wp_H, 1)
-        self.zmp_ref_xy_seq[env_ids] = root_xy[:, None, :].repeat(1, self._zmp_ref_N, 1)
-        self.prev_zero_command[env_ids] = False
-        self.com_ref_xy_seq[env_ids]  = root_xy[:, None, :].repeat(1, self._zmp_ref_N, 1)
-        self.com_ref_dxy_seq[env_ids] = 0.0
-        
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -281,26 +276,26 @@ class B2LabEnv(DirectRLEnv):
         self.extras["log"].update(reward_extras)
         self.extras["log"].update(termination_extras)
 
+        # terrain curriculum 진행도 로깅 (평균 terrain level). plane 지형엔 terrain_levels 없음(방어).
+        if getattr(self.cfg, "terrain_curriculum", False) and getattr(self._terrain, "terrain_levels", None) is not None:
+            self.extras["log"]["Curriculum/terrain_level"] = torch.mean(self._terrain.terrain_levels.float())
+
         self._ep_track_sum[env_ids] = 0.0
         self._ep_track_count[env_ids] = 0.0
 
     def _step_contact_targets(self):
         gait_prev = self.gait_indices.clone()
-        self.gait_indices = torch.remainder(self.gait_indices + self.dt * 1.0, 1.0)
-        durations = torch.full((self.num_envs, 1), 0.7, device=self.device)
-        # trott = torch.tensor([0.0, 0.5, 0.5, 0.0], device=self.device).unsqueeze(0)
-        walk = torch.tensor([0.0, 0.25, 0.5, 0.75], device=self.device).unsqueeze(0)
+        self.gait_indices = torch.remainder(self.gait_indices + self.dt * 1.3, 1.0)
+        durations = torch.full((self.num_envs, 1), 0.5, device=self.device)
+        trott = torch.tensor([0.0, 0.5, 0.5, 0.0], device=self.device).unsqueeze(0)
+        # walk = torch.tensor([0.0, 0.25, 0.5, 0.75], device=self.device).unsqueeze(0)
         # gait_offsets = torch.where(self.gait_types[:, None] == 0, trott, walk)
-        gait_offsets = walk
+        gait_offsets = trott
         foot_indices = torch.remainder(self.gait_indices.unsqueeze(1) + gait_offsets, 1.0)
         self.foot_indices = foot_indices.clone()
-        self.zero_command = (self._commands[:, :3].abs() < 0.05).all(dim=1)
-        # #----------------- ZMP preview 업데이트 -----------------#
-        # enter_zero = self.zero_command & (~self.prev_zero_command)
-        # self._update_zmp_preview_from_cmd(gait_prev=gait_prev, enter_zero=enter_zero)
-        # self._update_com_preview_from_zmp_ref(enter_zero=enter_zero)
-        # self.prev_zero_command = self.zero_command.clone()
-        # #----------------- ZMP preview 업데이트 -----------------#
+        self.zero_command = (
+            self._commands[:, :3].abs() < self.cfg.commands.zero_command_threshold
+        ).all(dim=1)
 
         mask_zero = self.zero_command.unsqueeze(1)
         foot_at_zero = torch.abs(foot_indices) < 0.05
@@ -384,15 +379,8 @@ class B2LabEnv(DirectRLEnv):
             if "interval" in self.event_manager.available_modes:
                 self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        # observation noise는 _get_observations 내부에서 history push 전에 적용됨
         self.obs_buf = self._get_observations()
-
-        # observation noise (앞부분: ang_vel3+grav3+cmd3+joint_pos+joint_vel = 9+2*num_actions 에만 적용)
-        n_noisy = 9 + 2 * self.num_actions  # B2 = 9 + 24 = 33
-        prop_obs_noisy = self.obs_buf["prop_obs"][:, :n_noisy]
-        prop_obs_clean = self.obs_buf["prop_obs"][:, n_noisy:]
-        if self.cfg.observation_noise_model:
-            prop_obs_noisy = self._observation_noise_model(prop_obs_noisy)
-        self.obs_buf["prop_obs"] = torch.cat([prop_obs_noisy, prop_obs_clean], dim=-1)
 
         # RSL-RL extras
         if "observations" not in self.extras:
@@ -402,7 +390,7 @@ class B2LabEnv(DirectRLEnv):
         return self.obs_buf, self.rew_buf, self.cost_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     def _parse_cfg(self, cfg):
-        self.dt = 1 / 50
+        self.dt = 1 / 100
         self.reward_scales = self.class_to_dict(self.cfg.rewards.scales)
         self.cost_scales = self.class_to_dict(self.cfg.costs.scales)
         self.command_ranges = self.class_to_dict(self.cfg.commands.ranges)
@@ -426,10 +414,12 @@ class B2LabEnv(DirectRLEnv):
     def _init_buffers(self):
         self.num_actions = gym.spaces.flatdim(self.single_action_space)  # B2 : 12
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
+        self._hip_roll_joint_ids, _ = self._robot.find_joints(".*_hip_joint")
+        self._action_scale = torch.full((self.num_actions,), self.cfg.action_scale, device=self.device)
+        self._action_scale[self._hip_roll_joint_ids] *= self.cfg.hip_roll_action_scale_factor
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
         self._heading_cmd = torch.zeros(self.num_envs, device=self.device)
         self._processed_actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
-        self.frequencies = torch.zeros(self.num_envs, device=self.device)
         self.gait_indices = torch.zeros(self.num_envs, device=self.device)
         self.gait_types = torch.randint(0, 1, (self.num_envs,), device=self.device)
         self.clock_inputs = torch.ones(self.num_envs, 4, device=self.device)
@@ -442,23 +432,32 @@ class B2LabEnv(DirectRLEnv):
         self._feet_ids_contact, _ = self._contact_sensor.find_bodies(_FOOT_ORDER, preserve_order=True)  # contact 데이터용(net_forces)
         self._base_id, _ = self._contact_sensor.find_bodies("base_link")
 
-        self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies([".*thigh.*", ".*calf.*"])
-        self._body_contact_ids, _ = self._contact_sensor.find_bodies("base_link")
-        self.masses_tensor = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False)
+        self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies([".*calf.*"])
+        self._body_contact_ids, _ = self._contact_sensor.find_bodies("base_link", ".*thigh.*")
         # 발 4개의 collision shape 인덱스를 body→shape 매핑으로 정확히 계산 (USD 마다 shape 개수 상이)
         self._foot_shape_ids = self._compute_foot_shape_ids()
-        self.static_fric_coeffs = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
-        self.dynamic_fric_coeffs = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
-        self.restitution_coeffs = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
         self.actuator_stiffness_gains = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.actuator_damping_gains = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         mat = self._robot.root_physx_view.get_material_properties().to(self.device)  # [N, num_shapes, 3]
-        self.static_fric_coeffs = mat[:, self._foot_shape_ids, 0]
         self.dynamic_fric_coeffs = mat[:, self._foot_shape_ids, 1]
-        self.restitution_coeffs = mat[:, self._foot_shape_ids, 2]
-        for _, actuator in self._robot.actuators.items():
-            self.actuator_stiffness_gains = (self._robot.data.default_joint_stiffness - actuator.stiffness)
-            self.actuator_damping_gains = (self._robot.data.default_joint_damping - actuator.damping)
+        # privileged obs용 gain 편차: 기본값 대비 상대 비율(±0.1 수준)로 저장.
+        # actuator 그룹별로 해당 joint 인덱스에만 기록 (그룹이 여러 개여도 안전)
+        for actuator in self._robot.actuators.values():
+            ids = actuator.joint_indices
+            self.actuator_stiffness_gains[:, ids] = (
+                actuator.stiffness / self._robot.data.default_joint_stiffness[:, ids].clamp(min=1e-6) - 1.0
+            )
+            self.actuator_damping_gains[:, ids] = (
+                actuator.damping / self._robot.data.default_joint_damping[:, ids].clamp(min=1e-6) - 1.0
+            )
+
+        # observation noise: 물리 단위 std에 obs scale을 곱해 scaled space 벡터로 변환.
+        # cmd(6:9)/actions(33:45)/clock(45:49)은 내부 생성값이라 노이즈 0
+        self.obs_noise_std_vec = torch.zeros(self.cfg.num_proprio, device=self.device)
+        self.obs_noise_std_vec[0:3] = self.cfg.noise_std.ang_vel * 0.25
+        self.obs_noise_std_vec[3:6] = self.cfg.noise_std.gravity
+        self.obs_noise_std_vec[9:21] = self.cfg.noise_std.joint_pos
+        self.obs_noise_std_vec[21:33] = self.cfg.noise_std.joint_vel * 0.05
         self.rew_buf = torch.zeros(self.num_envs, device=self.device)
         self.rew_buf_pos = torch.zeros(self.num_envs, device=self.device)
         self.rew_buf_neg = torch.zeros(self.num_envs, device=self.device)
@@ -466,8 +465,10 @@ class B2LabEnv(DirectRLEnv):
         self.obs_buf = {}  # observation 딕셔너리 초기화
         self.com_height = torch.zeros(self.num_envs, 1, device=self.device)
 
+        # 주의: actor_obs는 항상 0 텐서. 값은 안 쓰이지만 obs dict "policy" 키의 shape을
+        # runner가 num_actor_obs(=prop+v+z 차원) 결정에 사용하므로 지우면 안 됨.
+        # 실제 actor 입력은 runner/alg에서 prop_obs + CENet(v_hat, z_hat)로 직접 조립됨.
         self.actor_obs = torch.zeros(self.num_envs, self.cfg.num_actor_obs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.heights_buf = torch.zeros(self.num_envs, self.cfg.num_scandots, dtype=torch.float, device=self.device, requires_grad=False)
         self.critic_obs = torch.zeros(self.num_envs, self.cfg.num_critic_obs, dtype=torch.float, device=self.device, requires_grad=False)
         self.privileged_obs_buf = torch.zeros(self.num_envs, self.cfg.num_privileged_obs, device=self.device, dtype=torch.float)
         self.obs_history_buf = torch.zeros(self.num_envs, self.cfg.num_history_len, self.cfg.num_proprio, device=self.device, dtype=torch.float)
@@ -480,43 +481,23 @@ class B2LabEnv(DirectRLEnv):
         self.foot_velocity_mean = torch.zeros(self.num_envs, 3, device=self.device)
         self.foot_pos_b = torch.zeros(self.num_envs, 4, 3, device=self.device) 
         self.foot_velocities_b = torch.zeros(self.num_envs, 4, 3, device=self.device)
-        # B2 기립자세 nominal foot position (base frame), 순서 [FL,FR,RL,RR].
-        # 기립자세(zero-action)로 세틀시킨 실측값 (raibert_foot_placement 보상 기준점).
-        self.default_foot_pos_b = torch.zeros(self.num_envs, 4, 3, device=self.device)
-        self.default_foot_pos_b[:] = torch.tensor([
-            [ 0.427,  0.191, -0.452],   # FL
-            [ 0.423, -0.192, -0.458],   # FR
-            [-0.232,  0.193, -0.404],   # RL
-            [-0.234, -0.192, -0.409],   # RR
-        ], device=self.device)
-
         self.joint_pos_target = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_joint_pos_target = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_last_joint_pos_target = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
 
-        self.undesired_contacts = torch.zeros(self.num_envs, device=self.device)
         self.foot_force = torch.zeros(self.num_envs, 4, 3, device=self.device)
         self.foot_contact_time = torch.zeros((self.num_envs, 4), device=self.device)
         self.zero_command = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # 제로 커맨드 래치: 발별로 스윙 종료(stance 진입) 이후 1로 고정
         self.zero_hold_state = torch.zeros(self.num_envs, 4, dtype=torch.bool, device=self.device)
-        self._ep_start_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self._ep_progress = torch.zeros(self.num_envs, device=self.device)
         # episode tracking accumulators
         self._ep_track_sum = torch.zeros(self.num_envs, device=self.device)      # 누적 점수
         self._ep_track_count = torch.zeros(self.num_envs, device=self.device)    # 누적 스텝 수
-        self._ep_track_mean = torch.zeros(self.num_envs, device=self.device)     # reset 시 log용(선택)
         self.footscanner_height_data = torch.zeros(self.num_envs, 4, device=self.device)
         self.foot_height_vec = torch.zeros(self.num_envs, 4 * 25, device=self.device)
-        self.forward_vec = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=torch.float).repeat(self.num_envs, 1)
-
-        self._lin_vel_xy_filt = torch.zeros(self.num_envs, 2, device=self.device)
-        self._yaw_stop_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.commands_scale = torch.tensor([2.0, 2.0, 0.25], device=self.device, requires_grad=False,)
-        #zmp reference 관련
-        self._init_zmp_preview_buffers(gait_freq=1.0, n_steps=4)
 
     def class_to_dict(self, obj) -> dict:
         if not hasattr(obj, "__dict__"):
@@ -643,9 +624,6 @@ class B2LabEnv(DirectRLEnv):
         self._commands[env_ids, 1] = torch_rand_float(
             self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1],(len(env_ids), 1), device=self.device).squeeze(1)
 
-        yaw_stop = (torch.rand(len(env_ids), device=self.device) < 0.30)
-        self._yaw_stop_mask[env_ids] = yaw_stop
-
         if self.cfg.commands.heading_command:
             self._heading_cmd[env_ids] = torch_rand_float(
                 self.command_ranges["heading"][0], self.command_ranges["heading"][1],(len(env_ids), 1), device=self.device).squeeze(1)
@@ -653,27 +631,50 @@ class B2LabEnv(DirectRLEnv):
             self._commands[env_ids, 2] = torch_rand_float(
                 self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1],(len(env_ids), 1), device=self.device).squeeze(1)
 
+        zero_command_mask = (
+            torch.rand(len(env_ids), device=self.device) < self.cfg.commands.zero_command_probability
+        )
+
+        # 5% mask 밖에서 우연히 세 command가 모두 threshold 안에 들어오는 경우는
+        # x command를 경계값으로 밀어 zero-command 판정에서 제외한다.
+        accidental_zero_mask = (~zero_command_mask) & (
+            self._commands[env_ids, :3].abs() < self.cfg.commands.zero_command_threshold
+        ).all(dim=1)
+        accidental_zero_env_ids = env_ids[accidental_zero_mask]
+        if len(accidental_zero_env_ids) > 0:
+            x_commands = self._commands[accidental_zero_env_ids, 0]
+            x_signs = torch.where(x_commands >= 0.0, 1.0, -1.0)
+            self._commands[accidental_zero_env_ids, 0] = (
+                x_signs * self.cfg.commands.zero_command_threshold
+            )
+
+        self._commands[env_ids[zero_command_mask], :3] = 0.0
+
     def compute_foot_height_data(
         self,
         foot_scanners,          # dict: {"hr","hl","fr","fl"}
         max_clearance=0.45,
         clip_range=(-1.0, 1.0),
     ):
-        foot_clearance_list = []     # [N] × 4   (RAW meters)
-        foot_height_vec_list = []    # [N, 9] × 4 (NORMALIZED)
+        foot_clearance_list = []     # [N] × 4 (RAW meters)
+        foot_height_vec_list = []    # [N, num_rays] × 4 (NORMALIZED)
 
-        for key in ["fl", "fr", "rl", "rr"]:
+        for foot_idx, key in enumerate(["fl", "fr", "rl", "rr"]):
             scanner = foot_scanners[key]
 
-            ray_hits_z = scanner.data.ray_hits_w[..., 2]          # [N, 9]
-            sensor_z = scanner.data.pos_w[:, 2].unsqueeze(1)      # [N, 1]
+            ray_hits_z = scanner.data.ray_hits_w[..., 2]          # [N, num_rays]
+            # RayCaster origin은 발보다 0.30 m 위에 있으므로 sensor pos가 아니라
+            # articulation의 실제 foot body 중심을 clearance 기준으로 사용한다.
+            foot_z = self._robot.data.body_pos_w[
+                :, self._feet_ids[foot_idx], 2
+            ].unsqueeze(1)                                         # [N, 1]
 
-            valid = torch.isfinite(ray_hits_z)                    # [N, 9]
+            valid = torch.isfinite(ray_hits_z)                    # [N, num_rays]
 
             # ---------- foot_height_vec (normalized) ----------
             # invalid는 "매우 멀다"로 취급해서 clamp(=1) 되게 유지 (기존 로직 유지)
             ground_z = torch.where(valid, ray_hits_z, torch.full_like(ray_hits_z, -1e6))
-            clearance_vec = sensor_z - ground_z                   # [N, 9]
+            clearance_vec = foot_z - ground_z - self.cfg.foot_radius
             clearance_vec_norm = torch.clamp(
                 clearance_vec / max_clearance, clip_range[0], clip_range[1]
             )
@@ -685,116 +686,11 @@ class B2LabEnv(DirectRLEnv):
             ground_z_max = ground_z_for_max.max(dim=1).values     # [N]
             valid_any = valid.any(dim=1)                          # [N]
 
-            clearance_raw = sensor_z[:, 0] - ground_z_max         # [N]  (meters)
+            clearance_raw = foot_z[:, 0] - ground_z_max - self.cfg.foot_radius
             clearance_raw = torch.where(valid_any, clearance_raw, torch.zeros_like(clearance_raw))
             foot_clearance_list.append(clearance_raw)
 
-        foot_clearance = torch.stack(foot_clearance_list, dim=1) - 0.035  # [N, 4]  RAW meters
-        foot_height_vec = torch.cat(foot_height_vec_list, dim=1)  # [N, 36] normalized
+        foot_clearance = torch.stack(foot_clearance_list, dim=1)  # [N, 4] raw meters
+        foot_height_vec = torch.cat(foot_height_vec_list, dim=1)  # [N, 4*num_rays] normalized
 
         return foot_clearance, foot_height_vec
-
-    def _update_lin_vel_filter(self):
-        v_xy = self._robot.data.root_lin_vel_b[:, :2]  # (N,2)
-        tau = 1.0  # 1초(=보행주기) 기준으로 저주파만 남김
-        alpha = self.dt / (tau + self.dt)  # (0,1)
-        self._lin_vel_xy_filt = (1.0 - alpha) * self._lin_vel_xy_filt + alpha * v_xy
-
-    def _init_zmp_preview_buffers(self, gait_freq: float = 1.0, n_steps: int = 4):
-        # fixed params
-        self._zmp_gait_freq = float(gait_freq)
-        self._zmp_n_steps   = int(n_steps)
-        self._zmp_T_step    = 1.0 / (self._zmp_gait_freq * self._zmp_n_steps)
-        self._zmp_wp_H  = self._zmp_n_steps + 1
-        self._zmp_seg   = self._zmp_wp_H - 1
-        N = int(round((self._zmp_seg * self._zmp_T_step) / self.dt))
-        self._zmp_ref_N = max(N, 1)
-        k = torch.arange(self._zmp_ref_N, device=self.device, dtype=torch.float32)          # [N]
-        bin_idx = torch.floor((k * self.dt) / self._zmp_T_step).to(torch.int64)             # [N]
-        self._zmp_hold_bin_idx = torch.clamp(bin_idx, 0, self._zmp_seg - 1)                 # [N]
-        # buffers (root_xy로 full-snap)
-        root_xy = self._robot.data.root_pos_w[:, :2].clone()                                # [B,2]
-        self.zmp_wp_xy_seq  = root_xy[:, None, :].repeat(1, self._zmp_wp_H, 1)              # [B,H,2]
-        self.zmp_ref_xy_seq = root_xy[:, None, :].repeat(1, self._zmp_ref_N, 1)             # [B,N,2]
-        self.zmp_wp_xy      = root_xy.clone()                                               # [B,2]
-        # zero enter detect
-        self.prev_zero_command = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.com_ref_xy_seq  = torch.zeros(self.num_envs, self._zmp_ref_N, 2, device=self.device)
-        self.com_ref_dxy_seq = torch.zeros(self.num_envs, self._zmp_ref_N, 2, device=self.device)
-
-    def _update_zmp_preview_from_cmd(self, gait_prev: torch.Tensor, enter_zero: torch.Tensor):
-        n_steps = self._zmp_n_steps
-
-        bin_prev = torch.floor(gait_prev * n_steps).to(torch.int64)
-        bin_now  = torch.floor(self.gait_indices * n_steps).to(torch.int64)
-        step_event = (bin_now != bin_prev)
-
-        # 1) enter_zero: full snap
-        if enter_zero.any():
-            root_xy = self._robot.data.root_pos_w[enter_zero, :2]
-            self.zmp_wp_xy_seq[enter_zero]  = root_xy[:, None, :].repeat(1, self._zmp_wp_H, 1)
-            self.zmp_ref_xy_seq[enter_zero] = root_xy[:, None, :].repeat(1, self._zmp_ref_N, 1)
-            self.zmp_wp_xy[enter_zero]      = root_xy
-
-        # 2) moving + step_event: shift + append
-        update = step_event & (~self.zero_command)
-        if update.any():
-            v_b = self._commands[:, :2]
-            v_w = quat_apply_yaw(
-                self._robot.data.root_quat_w,
-                torch.cat([v_b, torch.zeros_like(v_b[:, :1])], dim=-1),
-            )[:, :2]
-
-            seq_u = self.zmp_wp_xy_seq[update].clone()     # ✅ overlap 방지
-            seq_u[:, :-1] = seq_u[:, 1:]
-            seq_u[:, -1]  = seq_u[:, -2] + v_w[update] * self._zmp_T_step
-
-            self.zmp_wp_xy_seq[update] = seq_u
-            self.zmp_wp_xy[update]     = seq_u[:, 0]
-            self.zmp_ref_xy_seq[update] = seq_u[:, self._zmp_hold_bin_idx, :]
-
-    def _update_com_preview_from_zmp_ref(self, enter_zero: torch.Tensor):
-        g = 9.81
-        h = 0.5
-        w = (g / h) ** 0.5
-        dt = float(self.dt)
-        c = float(np.cosh(w * dt))
-        s = float(np.sinh(w * dt))
-        B = self.num_envs
-        N = self._zmp_ref_N
-
-        # 1) enter_zero: com_ref full snap, vel=0
-        if enter_zero.any():
-            root_xy = self._robot.data.root_pos_w[enter_zero, :2]
-            self.com_ref_xy_seq[enter_zero]  = root_xy[:, None, :].repeat(1, N, 1)
-            self.com_ref_dxy_seq[enter_zero] = 0.0
-
-        # 2) moving env만 forward sim으로 채움
-        moving = ~self.zero_command
-        if not moving.any():
-            return
-
-        x = self._robot.data.root_pos_w[:, :2]  # [B,2]
-        v_b = self._robot.data.root_lin_vel_b[:, :2]
-        xd = quat_apply_yaw(
-            self._robot.data.root_quat_w,
-            torch.cat([v_b, torch.zeros_like(v_b[:, :1])], dim=-1),
-        )[:, :2]
-
-        com_xy  = self.com_ref_xy_seq
-        com_dxy = self.com_ref_dxy_seq
-
-        for k in range(N):
-            p = self.zmp_ref_xy_seq[:, k, :]  # [B,2]
-            x0, xd0 = x, xd
-            x  = c * x0 + (s / w) * xd0 + (1.0 - c) * p
-            xd = (w * s) * x0 + c * xd0 - (w * s) * p
-
-            com_xy[moving,  k, :] = x[moving]
-            com_dxy[moving, k, :] = xd[moving]
-
-
-
-
-
-
