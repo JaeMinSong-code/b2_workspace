@@ -18,8 +18,10 @@ B2_ACTUATOR_CFG = DelayedPDActuatorCfg(
     effort_limit={".*_hip_joint": 200.0, ".*_thigh_joint": 200.0, ".*_calf_joint": 320.0},
     velocity_limit={".*_hip_joint": 23.0, ".*_thigh_joint": 23.0, ".*_calf_joint": 14.0},
     stiffness=160.0,
-    damping=5.0,
-    friction=0.01,
+    damping=5.0,   # PD 컨트롤러 Kd (explicit actuator → 파이썬 계산 토크에만 사용). plant 점성마찰 Fv 는 별개.
+    # friction 은 PhysX joint 마찰 "계수"(무차원, 하중 비례). 실기 Fc[N·m] 를 F_ref≈200N 로 나눈 근사 nominal.
+    # 학습 시 EventCfg 의 startup 랜덤화(operation="abs")가 관절 그룹별 범위로 이 값을 덮어쓴다.
+    friction={".*_hip_joint": 0.017, ".*_thigh_joint": 0.021, ".*_calf_joint": 0.035},
     min_delay=0,
     max_delay=5,
 )

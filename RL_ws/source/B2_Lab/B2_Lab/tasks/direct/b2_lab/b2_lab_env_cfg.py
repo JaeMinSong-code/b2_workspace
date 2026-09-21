@@ -11,6 +11,7 @@ from isaaclab.terrains import TerrainImporterCfg  # TerrainImporterCfg: 지형 �
 from isaaclab.utils import configclass
 from B2_Lab.robots.B2_robot import B2_CFG  # isort: skip
 from B2_Lab.terrains import ROUGH_TERRAINS_CFG, CUSTOM_TERRAINS_CFG, CURRICULUM_TERRAINS_CFG  # isort: skip
+from B2_Lab.tasks.direct.b2_lab.mdp_events import randomize_joint_damping  # isort: skip
 
 
 @configclass
@@ -62,14 +63,67 @@ class EventCfg:
         },
     )
 
-    # Joint friction randomization
-    randomize_joint_friction = EventTerm(
+    # ── 관절 마찰(Fc) 도메인 랜덤화 ────────────────────────────────────────────
+    # 실기 식별값은 고정 Coulomb 마찰 Fc[N·m] (tau_f = Fc·sign(dq)).
+    # 그러나 PhysX joint friction 은 "무차원 계수"이고 마찰토크 ≈ 계수·|관절 전달력| 로 하중 비례다.
+    # 대표 전달력 F_ref ≈ 200 N (B2 ~60kg, 다리당 stance 하중 ~150N + 여유) 기준으로
+    #   계수 = Fc / F_ref  로 근사한다. (하중 무관 고정 N·m 을 계수로 옮긴 근사치이므로
+    #   stance 부근에서만 목표 N·m 에 근접. 전체 스케일을 바꾸려면 F_ref 만 재조정하면 된다.)
+    # operation="abs" 로 계수를 절대값으로 설정(기존 add 방식/base friction 0.01 을 덮어씀).
+    # mode="startup" — 기존 랜덤화와 동일하게 시작 시 1회 관절별 샘플.
+    randomize_joint_friction_hip = EventTerm(   # hip_roll: Fc 1.5–5.0 N·m
         func=mdp.randomize_joint_parameters,
-        mode="startup", 
+        mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "friction_distribution_params": (0.0, 0.05),    # 관절 마찰 추가
-            "operation": "add",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint"),
+            "friction_distribution_params": (0.008, 0.025),
+            "operation": "abs",
+        },
+    )
+    randomize_joint_friction_thigh = EventTerm(  # hip_pitch: Fc 2.0–6.5 N·m
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*_thigh_joint"),
+            "friction_distribution_params": (0.010, 0.033),
+            "operation": "abs",
+        },
+    )
+    randomize_joint_friction_calf = EventTerm(   # knee: Fc 3.5–11.0 N·m
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*_calf_joint"),
+            "friction_distribution_params": (0.018, 0.055),
+            "operation": "abs",
+        },
+    )
+
+    # ── 관절 점성마찰(Fv) 도메인 랜덤화 ────────────────────────────────────────
+    # 실기 식별값 Fv[N·m·s/rad] (tau_f 의 Fv·dq 항)을 sim 관절 damping 으로 직접 주입.
+    # PD 컨트롤러 Kd(actuator.damping=5.0)와는 독립 — 순수 plant 점성마찰로 작용(단위 그대로 매핑).
+    randomize_joint_damping_hip = EventTerm(    # hip_roll: Fv 0.3–2.0
+        func=randomize_joint_damping,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint"),
+            "damping_range": (0.3, 2.0),
+        },
+    )
+    randomize_joint_damping_thigh = EventTerm(  # hip_pitch: Fv 0.2–1.5
+        func=randomize_joint_damping,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*_thigh_joint"),
+            "damping_range": (0.2, 1.5),
+        },
+    )
+    randomize_joint_damping_calf = EventTerm(   # knee: Fv 0.0–1.5
+        func=randomize_joint_damping,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*_calf_joint"),
+            "damping_range": (0.0, 1.5),
         },
     )
 
